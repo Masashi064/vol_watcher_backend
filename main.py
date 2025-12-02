@@ -10,6 +10,10 @@ import yfinance as yf
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+
+
+
+
 # =========================================================
 # Supabase クライアント初期化
 # =========================================================
@@ -44,15 +48,27 @@ supabase: Client = create_supabase_client()
 # 設定
 # =========================================================
 
-# ティッカー対応表（Yahoo Finance）
 INDEX_TICKERS = {
     "VIX": "^VIX",
-    "NIKKEI_VI": "^NKVI.OS",  # 日経平均ボラティリティ
-    # 将来増やしたくなったらここに追加
+    "NIKKEI_VI": "^NKVI.OS",
 }
 
-VOL_TABLE = "volatility_prices"   # 価格保存先テーブル
-ALERT_TABLE = "alert_rules"       # アラートルールテーブル
+VOL_TABLE = "volatility_prices"
+ALERT_TABLE = "vol_alert_rules"
+
+FRONTEND_BASE_URL = "https://vol-watcher-frontend.vercel.app"
+ALERTS_PAGE_URL = f"{FRONTEND_BASE_URL}/alerts"
+
+SYMBOL_LABELS = {
+    "VIX": "VIX（米国恐怖指数）",
+    "NIKKEI_VI": "日経平均ボラティリティ・インデックス",
+}
+
+SEVERITY_LABELS = {
+    "notice": "注意",
+    "warning": "警戒",
+    "critical": "緊急",
+}
 
 # =========================================================
 # yfinance から OHLC 取得
@@ -147,6 +163,123 @@ def send_alert_email(to_email: str, subject: str, body: str) -> bool:
         print(f"    [MAIL ERROR] {e}")
         return False
 
+def send_welcome_emails_for_new_rules() -> None:
+    """
+    enabled = true かつ welcome_sent = false のルールを取得し、
+    メールアドレスごとに1通だけ welcome メールを送る。
+    送信後、そのメールアドレスのルールの welcome_sent を true に更新する。
+    """
+    res = (
+        supabase
+        .table(ALERT_TABLE)
+        .select("*")
+        .eq("enabled", True)
+        .eq("welcome_sent", False)
+        .execute()
+    )
+    rules: list[Dict[str, Any]] = res.data or []
+    if not rules:
+        print("=== No new alert rules for welcome email. ===")
+        return
+
+    # email ごとにグループ化
+    rules_by_email: dict[str, list[Dict[str, Any]]] = {}
+    for rule in rules:
+        email = rule["email"]
+        rules_by_email.setdefault(email, []).append(rule)
+
+    print(f"=== Sending welcome emails for {len(rules_by_email)} addresses ===")
+
+    for email, rules_for_email in rules_by_email.items():
+        subject, body = build_welcome_email_for_email(email, rules_for_email)
+        sent = send_alert_email(email, subject, body)
+        if not sent:
+            continue
+
+        # このメールアドレスのルールはすべて welcome_sent = true にする
+        try:
+            supabase.table(ALERT_TABLE) \
+                .update({"welcome_sent": True}) \
+                .eq("email", email) \
+                .execute()
+        except Exception as e:
+            print(f"[WELCOME UPDATE ERROR email={email}] {e}")
+
+
+def build_threshold_alert_email(rule: Dict[str, Any], price: float) -> tuple[str, str]:
+    symbol = rule["symbol_code"]
+    direction = rule["direction"]
+    threshold = float(rule["threshold"])
+    severity = (rule.get("severity") or "notice").lower()
+
+    symbol_label = SYMBOL_LABELS.get(symbol, symbol)
+    severity_label = SEVERITY_LABELS.get(severity, severity)
+
+    subject = f"[Volatility Alert] {symbol_label} がアラート水準を超えました"
+
+    body_lines = [
+        "このメールは Volatility Dashboard のボラティリティ・アラート機能から自動送信されています。",
+        "",
+        "▼アラートが発生しました",
+        f"  対象指標 : {symbol_label} ({symbol})",
+        f"  判定条件 : {symbol} {direction} {threshold}",
+        f"  現在の終値 : {price:.2f}",
+        f"  重要度     : {severity_label}",
+        "",
+        "▼グラフ・アラートの確認",
+        f"  ダッシュボード : {FRONTEND_BASE_URL}",
+        f"  アラートの確認・解除 : {ALERTS_PAGE_URL}",
+        "",
+        "※今後このアラートを停止したい場合は、上記のアラート管理ページから対象のチェックを外してください。",
+        "※本メールは情報提供のみを目的としており、特定の投資行動を推奨するものではありません。",
+        "",
+        f"トリガー時刻 (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    return subject, "\n".join(body_lines)
+
+def build_welcome_email_for_email(email: str, rules: list[Dict[str, Any]]) -> tuple[str, str]:
+    """
+    1つのメールアドレスに対して、複数のアラートルールをまとめて案内する
+    welcome メールの subject / body を作成する。
+    """
+    subject = "[Volatility Alert] アラート登録が完了しました"
+
+    lines: list[str] = [
+        "Volatility Dashboard のボラティリティ・アラートをご利用いただきありがとうございます。",
+        "",
+        "以下の条件でアラートを登録しました。",
+        "",
+        "▼登録内容",
+    ]
+
+    for rule in rules:
+        symbol = rule["symbol_code"]
+        direction = rule["direction"]
+        threshold = float(rule["threshold"])
+        severity = (rule.get("severity") or "").lower()
+
+        symbol_label = SYMBOL_LABELS.get(symbol, symbol)
+        severity_label = SEVERITY_LABELS.get(severity, severity)
+
+        # 例）- VIX（米国恐怖指数） (VIX) >= 25 [注意]
+        lines.append(
+            f"  - {symbol_label} ({symbol}) {direction} {threshold} [{severity_label}]"
+        )
+
+    lines += [
+        "",
+        "▼グラフ・アラートの確認",
+        f"  ダッシュボード : {FRONTEND_BASE_URL}",
+        f"  アラートの確認・解除 : {ALERTS_PAGE_URL}",
+        "",
+        "※条件を変更したい場合や、アラートを停止したい場合は、上記のアラート管理ページから編集してください。",
+        "※本メールは情報提供のみを目的としており、特定の投資行動を推奨するものではありません。",
+    ]
+
+    body = "\n".join(lines)
+    return subject, body
+
+
 # =========================================================
 # アラートルール判定
 # =========================================================
@@ -212,23 +345,11 @@ def evaluate_alerts(latest_close: Dict[str, float]) -> None:
 
         # False -> True になった瞬間だけメール送信
         if now_result and not prev_result:
-            # 簡単な文面
-            subject = f"[{severity.upper()}] {symbol} が閾値 {threshold} を超えました"
-            body_lines = [
-                f"このメールはボラティリティ・アラートサービスから自動送信されています。",
-                "",
-                f"銘柄: {symbol}",
-                f"現在の終値: {price:.2f}",
-                f"条件: {symbol} {direction} {threshold}",
-                f"重要度: {severity}",
-                "",
-                f"トリガー時刻 (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-            ]
-            body = "\n".join(body_lines)
-
+            subject, body = build_threshold_alert_email(rule, price)
             sent = send_alert_email(email, subject, body)
             if sent:
                 update_fields["last_triggered_at"] = datetime.now(timezone.utc).isoformat()
+
         # True -> False / False -> False のときは last_result だけ更新
 
         # ルール行を更新
@@ -267,6 +388,9 @@ def main() -> None:
 
     print("\n=== Checking alert rules ===")
     evaluate_alerts(latest_close)
+
+    print("\n=== Sending welcome emails for new rules ===")
+    send_welcome_emails_for_new_rules()
 
     print("\nAll symbols processed & alerts checked.")
 
